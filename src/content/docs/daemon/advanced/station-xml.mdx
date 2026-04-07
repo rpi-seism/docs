@@ -1,0 +1,97 @@
+---
+title: StationXML Management
+description: Automatic generation and historical tracking of instrument response metadata (FDSN StationXML).
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, Code } from '@astrojs/starlight/components';
+
+The daemon automatically generates and maintains a **StationXML** file (`station.xml`). This file is the "passport" for your seismic data, containing the metadata required to convert raw ADC counts into physical ground motion (velocity, displacement, or acceleration).
+
+## Purpose of StationXML
+
+1.  **Instrument Deconvolution:** Allows software like ObsPy to "undo" the effects of the geophone, amplifier, and ADC.
+2.  **FDSN Compliance:** Metadata is formatted to the international standard for seismic data exchange.
+
+---
+
+## Fingerprint Tracking
+
+Every time the daemon starts, it calculates a **SHA-256 fingerprint** of your hardware settings (gain, sensitivity, sample rate, etc.). This is stored in `station.xml.sha256`.
+
+- **Included in Fingerprint:** `network`, `station`, `sampling_rate`, `adc_gain`, `vref`, and all channel-specific physical constants.
+- **Excluded:** Job settings like trigger thresholds or notification URLs (as these don't affect the raw data values).
+
+---
+
+## Epoch & History Management
+
+An **Epoch** is a period where the instrument response remains constant. If you swap a geophone or change the analog gain, you must signal the start of a new epoch.
+
+### The Epoch Logic Flow
+
+<Steps>
+1.  **Change Detected:** You modify a hardware setting (e.g., `analog_gain`) in `config.yml`.
+2.  **Validation:** The daemon compares the new settings against the stored fingerprint.
+3.  **The `start_date` Check:**
+    -   **If `start_date` is unchanged:** The daemon raises a `StationXMLEpochError` and refuses to start. This prevents corrupting your existing metadata.
+    -   **If `start_date` is updated:** The daemon closes the current epoch in `station.xml` (setting the `EndDate`) and appends a new epoch starting at your new date.
+</Steps>
+
+<Aside type="danger" title="StationXMLEpochError">
+  If you see this error, you **must** update the `start_date` string in your `config.yml` to the current UTC time. This marks the exact moment the hardware configuration changed.
+</Aside>
+
+---
+
+## The 3-Stage Response Chain
+
+The daemon calculates the total system sensitivity by combining three distinct hardware stages.
+
+
+
+<Tabs>
+  <TabItem label="Stage 1: Geophone">
+    **Physics: Pole-Zero (LAPLACE)**
+    Computed using `natural_frequency` and `damping`.
+    
+    $$\text{H}(s) = \frac{s^2 \cdot A_0}{(s - p_1)(s - p_1^*)(s - p_2)(s - p_2^*)}$$
+
+    *Calculates the conversion from Ground Motion (m/s) to Voltage (V).*
+  </TabItem>
+  <TabItem label="Stage 2: Amplifier">
+    **Physics: Scalar Gain**
+    A simple multiplier based on your instrumentation amplifier (e.g., LT1167).
+    
+    - **Source:** `analog_gain` in `config.yml`.
+    - **Unit:** V/V.
+  </TabItem>
+  <TabItem label="Stage 3: ADC">
+    **Physics: Digital Sensitivity**
+    Calculates how many digital counts represent 1 Volt.
+    
+    $$\text{Counts/V} = \frac{\text{ADC Gain} \times 2^{23}}{V_{ref}}$$
+
+    *Example (Gain 64, 2.5V Ref): ~215,384,678 Counts/V.*
+  </TabItem>
+</Tabs>
+
+### Total System Sensitivity
+The final `<InstrumentSensitivity>` value is the product of all three stages. For a standard GD-4.5 setup, this is typically in the range of **~620,307,472,640 counts/(m/s)**.
+
+---
+
+## Using the StationXML
+
+### In Python (ObsPy)
+You can easily remove the instrument effect to get real-world velocity:
+
+```python
+from obspy import read, read_inventory
+
+st = read("data/archive/2026/XX/RPI3/EHZ.D/...")
+inv = read_inventory("station.xml")
+
+# Convert raw counts to Velocity (m/s)
+st.remove_response(inventory=inv, output="VEL")

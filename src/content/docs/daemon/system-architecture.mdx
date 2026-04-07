@@ -1,0 +1,107 @@
+---
+title: System Architecture
+description: Deep dive into the rpi-seism multi-threaded design, memory management, and data flow.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The **rpi-seism daemon** is built on a **producer-consumer pattern**. It uses thread-safe queues to connect independent worker threads, ensuring that high-speed data acquisition is never blocked by slower operations like disk I/O or network latency.
+
+## Design Philosophy
+
+- **Parallelism:** Each job runs concurrently, utilizing multiple CPU cores.
+- **Isolation:** A failure in the WebSocket thread won't stop data from being saved to disk.
+- **Backpressure:** Queues buffer spikes in data without dropping samples.
+- **Clean Shutdown:** Coordinated stop sequence ensures zero data loss on exit.
+
+---
+
+## Threading Model
+
+The daemon initializes five specialized threads on startup.
+
+| Thread | Priority | CPU % | Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Reader** | **High** | 5-10% | Serial I/O, CRC validation, Queue distribution |
+| **MSeedWriter** | Medium | 2-5% | MiniSEED generation, SDS Disk Archival |
+| **WSSender** | Medium | 5-8% | 4x Decimation, JSON broadcasting |
+| **Trigger** | Medium | 1-3% | Real-time STA/LTA event processing |
+| **Notifier** | Low | \<1% | External alerts (Telegram, Email) |
+
+### Communication Flow
+
+The **Reader** acts as the primary Producer. It pushes 16-byte validated packets into four independent queues:
+
+
+
+1. **`mseed_queue`** → MSeedWriter
+2. **`websocket_queue`** → WebSocketSender
+3. **`trigger_queue`** → TriggerProcessor
+4. **`notifier_queue`** → NotifierSender
+
+---
+
+## Data Structures
+
+The protocol uses fixed-length binary packets for efficiency over the RS-422 link.
+
+<Tabs>
+  <TabItem label="ADC Packet (16B)">
+    Sent 100 times per second from the MCU.
+    
+    | Offset | Type | Field | Description |
+    | :--- | :--- | :--- | :--- |
+    | 0-1 | `uint8` | `header` | `0xAA 0xBB` marker |
+    | 2-5 | `int32` | `ch0` | Channel 0 (Vertical) |
+    | 6-9 | `int32` | `ch1` | Channel 1 (North/South) |
+    | 10-13| `int32` | `ch2` | Channel 2 (East/West) |
+    | 14-17| `uint32`| `crc` | CRC-32 Checksum |
+  </TabItem>
+  
+  <TabItem label="Handshake (6B)">
+    Sent by Daemon to MCU on startup to sync parameters.
+    
+    | Offset | Type | Field | Description |
+    | :--- | :--- | :--- | :--- |
+    | 0-1 | `uint8` | `header` | `0xCC 0xDD` marker |
+    | 2-3 | `uint16`| `rate` | Output Hz (Little Endian) |
+    | 4 | `uint8` | `gain` | PGA Enum (0-6) |
+    | 5 | `uint8` | `drate` | SPS Enum (0-15) |
+  </TabItem>
+</Tabs>
+
+---
+
+## Resource & Memory Management
+
+The daemon is designed to run on low-resource hardware like the Raspberry Pi 4/5.
+
+### Buffer Sizing
+- **MSeedWriter:** Buffers 30 minutes of data (~2.2 MB total for 3 channels).
+- **TriggerProcessor:** Maintains a 20s rolling window for STA/LTA (~16 KB).
+- **Event Buffer:** On trigger, the Notifier captures 60s pre-event and 60s post-event (~144 KB).
+
+### Storage Layout (SDS)
+Data is stored following the **SeisComP Data Structure (SDS)**:
+`archive/YEAR/NET/STA/CHAN.D/NET.STA.LOC.CHAN.D.YEAR.DOY`
+
+---
+
+## Network Architecture
+
+### WebSocket Streaming (`ws://8765`)
+The daemon broadcasts two types of JSON messages:
+- **Type 0 (Waveform):** 25 Hz decimated data for live dashboards.
+- **Type 1 (SOH):** State-of-Health metrics (link quality, checksum errors) sent every 5s.
+
+```json
+{
+  "type": 0,
+  "payload": {
+    "channel": "EHZ",
+    "fs": 25.0,
+    "data": [120, 135, 142] 
+  }
+}

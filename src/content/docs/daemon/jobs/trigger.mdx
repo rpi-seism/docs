@@ -1,0 +1,66 @@
+---
+title: Trigger Processor Job
+description: Real-time earthquake detection using the Recursive STA/LTA algorithm.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Steps, Aside, Card } from '@astrojs/starlight/components';
+
+The **TriggerProcessor** monitors a single seismic channel (typically the vertical component, `EHZ`) to detect earthquake events in real-time. It uses the industry-standard **STA/LTA** (Short-Term Average / Long-Term Average) algorithm to distinguish between background noise and impulsive seismic arrivals.
+
+## How it Works: Recursive STA/LTA
+
+The algorithm calculates the ratio between the average signal amplitude in a moving short-term window and a moving long-term window.
+
+
+
+- **STA (Short-Term Average):** Captures the immediate "energy" of the seismic wave (e.g., 0.5 seconds).
+- **LTA (Long-Term Average):** Captures the "background" noise level (e.g., 10 seconds).
+- **Ratio:** $\text{Ratio} = \frac{\text{STA}}{\text{LTA}}$
+
+### The Hysteresis Principle
+To prevent the system from rapidly flickering "ON" and "OFF" during a shaky earthquake, we use **Dual Thresholds**:
+
+<Steps>
+1. **Trigger ON:** When the Ratio crosses `thr_on` (e.g., **3.5**), the `earthquake_event` is set.
+2. **Stay ON:** Even if the ratio drops to 2.0, the event remains active.
+3. **Trigger OFF:** Only when the ratio falls below `thr_off` (e.g., **1.5**) is the event cleared.
+</Steps>
+
+<Aside type="tip" title="Why Hysteresis?">
+  Without a lower "OFF" threshold, a single earthquake would trigger dozens of separate "events" as the signal oscillates above and below a single line. Hysteresis ensures one earthquake equals one clean detection.
+</Aside>
+
+---
+
+## Configuration
+
+These parameters are defined in the `jobs_settings.trigger` section of your `config.yml`.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `sta_sec` | `0.5` | Sensitivity to sharp onsets (seconds). |
+| `lta_sec` | `10.0` | Background noise averaging window (seconds). |
+| `thr_on` | `3.5` | Ratio required to declare an earthquake. |
+| `thr_off` | `1.5` | Ratio required to end the event. |
+| `trigger_channel` | `EHZ` | The physical channel monitored for triggers. |
+
+---
+
+## Implementation Details
+
+The processor uses a thread-safe `deque` (Rolling Buffer) to maintain exactly enough data for stable LTA calculation without consuming excessive memory.
+
+### Buffer Strategy
+- **Type:** `collections.deque(maxlen=2000)`
+- **Size:** $2 \times \text{LTA Window}$. For a 10s LTA at 100Hz, this is 2000 samples (~16 KB).
+- **Processing:** The `recursive_sta_lta` function from **ObsPy** is called every time a new packet arrives (100 times per second).
+
+```python title="Trigger Logic Snippet"
+# Compute characteristic function
+cft = recursive_sta_lta(data_arr, nsta, nlta)
+current_ratio = cft[-1]
+
+if current_ratio > thr_on and not last_trigger:
+    earthquake_event.set() # Alert other threads!

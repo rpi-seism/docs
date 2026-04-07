@@ -1,0 +1,50 @@
+---
+title: Notifier Sender Job
+description: Real-time earthquake alerting via Telegram, Discord, and Email with interactive Plotly waveforms.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, Table } from '@astrojs/starlight/components';
+
+The **NotifierSender** is the communication bridge of the daemon. It monitors the `earthquake_event` signal and sends instant alerts to external services using the **Apprise** library. Beyond simple text alerts, it generates and attaches interactive HTML waveforms of the detected event.
+
+## Architecture & Lifecycle
+
+The Notifier maintains a high-resolution rolling buffer to ensure that when an alert is sent, the user sees what happened *before* the trigger as well as after.
+
+
+
+- **Input:** `notifier_queue` (Continuous 100 Hz stream for buffering).
+- **Trigger:** `earthquake_event` (from the Trigger Processor).
+- **Output:** Multi-channel notifications via Telegram, Discord, Email, or Slack.
+
+---
+
+## Event Handling Logic
+
+When an earthquake is detected, the Notifier follows a strict timing sequence to capture the full waveform.
+
+<Steps>
+1. **Pre-Event Buffering:** The thread constantly keeps the last **60 seconds** of data in a `deque` buffer.
+2. **Immediate Alert:** As soon as `earthquake_event` is set, a text-only "Initial Alert" is sent to the user (e.g., via Telegram).
+3. **Post-Event Collection:** The thread waits another **60 seconds** to capture the earthquake.
+4. **Report Generation:** A 120-second interactive plot (60s pre + 60s post) is generated using **Plotly**.
+5. **Final Delivery:** The interactive HTML report is sent as an attachment to the existing alert thread.
+</Steps>
+
+<Aside type="caution" title="Cooldown Mechanism">
+  To prevent "notification storms" during long earthquakes or aftershocks, a **30-second cooldown** is enforced. If a new trigger occurs within 30 seconds of the last one, it is ignored by the Notifier.
+</Aside>
+
+---
+
+## Configuration
+
+The Notifier uses **Apprise URLs**, allowing you to swap notification services without changing code.
+
+```yaml title="config.yml"
+jobs_settings:
+  notifiers:
+    - url: "tgram://{bot_token}/{chat_id}/"
+      enabled: true

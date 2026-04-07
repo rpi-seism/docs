@@ -1,0 +1,150 @@
+---
+title: Serial Protocol
+description: RS-422 Binary Protocol Specification for rpi-seism.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The **rpi-seism daemon** communicates with the MCU via a high-speed, fixed-length binary protocol over **RS-422 differential signaling**.
+
+## Physical Layer
+
+<CardGrid>
+  <Card title="Electrical Specs" icon="setting">
+    - **Baud Rate:** 250,000 (Fixed)
+    - **Data/Parity/Stop:** 8-N-1
+    - **Voltage:** ±2V (RS-422 Standard)
+    - **Flow Control:** None (Heartbeat-based)
+  </Card>
+  <Card title="Hardware" icon="laptop">
+    - **MCU Transceiver:** MAX490E
+    - **Cabling:** Cat5/6 Twisted Pair
+  </Card>
+</CardGrid>
+
+### Pinout (MCU → Host)
+
+<Aside type="danger">
+  The pinout is still to be defined, this is only an example
+</Aside>
+
+| Signal | Cat5/6 Color | Function |
+| :--- | :--- | :--- |
+| **TX+** | Orange/Orange-White | Transmit Positive |
+| **TX-** | Blue/Blue-White | Transmit Negative |
+| **GND** | Brown/Brown-White | Common Ground |
+| **VCC** | Green/Green-White | +12V power |
+
+<Aside type="caution">
+  This is a **simplex (one-way)** link for data streaming. The MCU transmits continuously; the daemon only sends heartbeats and initial configuration.
+</Aside>
+
+---
+
+## Packet Type 1: ADC Data
+**Frequency:** 100 Hz | **Length:** 16 Bytes
+
+This packet carries the raw 24-bit triaxial seismic data.
+
+### Binary Structure
+| Offset | Size | Type | Field | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| 0 | 1 | `uint8` | `header_1` | Fixed marker `0xAA` |
+| 1 | 1 | `uint8` | `header_2` | Fixed marker `0xBB` |
+| 2 | 4 | `int32_le` | `ch0` | Channel 0 (Vertical) |
+| 6 | 4 | `int32_le` | `ch1` | Channel 1 (North/South) |
+| 10 | 4 | `int32_le` | `ch2` | Channel 2 (East/West) |
+| 14 | 4 | `uint32_le`| `crc` | CRC-32 (Bytes 0-13) |
+
+### ADC Value Mapping
+The ADS1256 returns **signed 24-bit** values, sign-extended to 32-bit integers for transmission:
+- **Max Positive:** `0x007FFFFF` (+8,388,607)
+- **Zero:** `0x00000000`
+- **Max Negative:** `0xFF800000` (-8,388,608)
+
+---
+
+## Packet Type 2: Settings Handshake
+**Frequency:** Once on startup | **Length:** 6 Bytes
+
+On daemon initialization, settings are pushed to the MCU to sync sampling rates and analog gain.
+
+<Steps>
+1. **Daemon → MCU:** Sends configuration packet `[0xCC, 0xDD, RATE_L, RATE_H, GAIN, DRATE]`.
+2. **MCU → Daemon:** Echoes the exact same 6 bytes back.
+3. **Daemon:** Verifies the echo. If it matches, streaming begins. If no echo within 10s, it raises `MCUNoResponse`.
+</Steps>
+
+| Field | Description | Example (100Hz, Gain 64) |
+| :--- | :--- | :--- |
+| `sampling_speed` | Output rate in Hz (uint16_le) | `0x64 0x00` |
+| `adc_gain` | PGA enum (0-6) | `0x06` |
+| `adc_data_rate` | ADS1256 DRATE enum | `0x0B` (2000 SPS) |
+
+---
+
+## Error Detection (CRC-32)
+
+We use the standard **Ethernet/PKZip** polynomial (`0x04C11DB7`). If a checksum fails, the daemon discards the packet and re-aligns the buffer to the next `0xAA 0xBB` header.
+
+<Tabs>
+  <TabItem label="Python (Daemon)">
+    ```python
+    from binascii import crc32
+    import struct
+
+    # Validate incoming buffer
+    payload = data[:-4] 
+    calc_crc = crc32(payload) & 0xFFFFFFFF
+    rx_crc = struct.unpack("<I", data[-4:])[0]
+
+    if calc_crc == rx_crc:
+        # Packet is valid
+    ```
+  </TabItem>
+  <TabItem label="C++ (Firmware)">
+    ```cpp
+    uint32_t crc = calculate_crc32(packet_buffer, 14);
+    memcpy(&packet_buffer[14], &crc, 4);
+    Serial.write(packet_buffer, 16);
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Reliability Mechanisms
+
+### The Heartbeat
+To prevent the MCU from flooding the serial buffer if the daemon crashes, the MCU **pauses streaming** if it doesn't receive a heartbeat for > 1 second.
+- **Heartbeat:** Single byte `0x01`.
+- **Interval:** Sent by daemon every 500ms.
+
+### Timing Budget (100 Hz)
+At 250kbps, the transmission overhead is minimal, leaving significant headroom for OS processing.
+
+| Stage | Time (ms) |
+| :--- | :--- |
+| Packet TX (128 bits) | 0.512 ms |
+| USB-Serial Latency | ~0.200 ms |
+| Daemon Processing | ~0.100 ms |
+| **Total Latency** | **~0.812 ms** |
+| **Available Headroom** | **9.188 ms** |
+
+---
+
+## Troubleshooting
+
+:::danger[Checksum Errors]
+If you see frequent `Checksum failed` logs:
+1. **Check Cables:** Ensure you are using twisted-pair (Cat5/6).
+2. **Grounding:** Verify the common ground (Blue wire) is connected between MCU and Pi.
+3. **Power:** Ensure the RS-422 transceiver is getting a stable 3.3V/5V.
+:::
+
+:::tip[No Data Flow]
+Ensure the user is in the `dialout` group:
+`sudo usermod -a -G dialout $USER`
+:::

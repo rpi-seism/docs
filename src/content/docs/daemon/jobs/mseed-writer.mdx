@@ -1,0 +1,109 @@
+---
+title: MSeedWriter Job
+description: Technical reference for the MiniSEED archival thread and SDS storage structure.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, FileTree } from '@astrojs/starlight/components';
+
+The **MSeedWriter** thread is responsible for long-term data persistence. It buffers incoming samples in memory and flushes them to disk using the industry-standard **MiniSEED** format and **SDS (SeisComP Data Structure)** hierarchy.
+
+## Architecture
+
+The writer consumes raw data and coordinates with the [Trigger Processor](/daemon/jobs/trigger) to prioritize earthquake data.
+
+
+
+- **Input:** `msed_writer_queue` (Raw ADC counts).
+- **Trigger:** `earthquake_event` (Signals an immediate flush).
+- **Output:** Structured SDS archive on local disk.
+
+---
+
+## SDS Directory Structure
+
+To ensure compatibility with global seismological tools (like SeisComP or ObsPy), data is organized into a nested date/station hierarchy:
+
+<FileTree>
+- data/
+  - archive/
+    - 2026/
+      - XX/ (Network)
+        - RPI3/ (Station)
+          - EHZ.D/ (Channel.Type)
+            - XX.RPI3.00.EHZ.D.2026.095 (Full Record)
+</FileTree>
+
+---
+
+## Initialization & State
+
+The writer maintains internal buffers to minimize disk I/O operations, which is critical for extending the life of SD cards on Raspberry Pi deployments.
+
+<Tabs>
+  <TabItem label="Parameters">
+    | Parameter | Type | Purpose |
+    | :--- | :--- | :--- |
+    | `output_dir` | `Path` | The root of the SDS archive. |
+    | `earthquake_event` | `Event` | Shared signal to trigger a 5-minute "event flush." |
+    | `write_interval` | `float` | Default: 1800s (30 minutes) between writes. |
+  </TabItem>
+  <TabItem label="Internal Buffers">
+    | Variable | Format | Description |
+    | :--- | :--- | :--- |
+    | `_buffer` | `dict` | Keyed by channel (e.g., `{"EHZ": [...]}`). |
+    | `_start_time` | `float` | Unix timestamp of the first sample in current buffer. |
+  </TabItem>
+</Tabs>
+
+---
+
+## The Flush Procedure
+
+Flushing data to disk is a non-trivial process that involves time alignment and file merging.
+
+<Steps>
+1. **Midnight Check:** The buffer is scanned for midnight boundaries using `split_buffer_at_midnight()`. If a buffer spans two days, it is sliced into two separate chunks.
+2. **Trace Construction:** Each slice is converted into an ObsPy `Trace` object with correct FDSN metadata (Network, Station, Location, Channel).
+3. **SDS Pathing:** The target file path is calculated based on the sample timestamp.
+4. **Merge Logic:**
+    - **If file exists:** The existing day-file is read, the new data is appended, and ObsPy `merge(method=1)` is called to handle overlaps or gaps.
+    - **If new file:** A new MiniSEED file is initialized with Steim-2 compression.
+5. **Disk Write:** The stream is written to disk with a fixed record length of **512 bytes**.
+</Steps>
+
+---
+
+## Earthquake Early Flush
+
+While the default flush happens every 30 minutes, earthquakes require faster persistence to ensure data isn't lost if the system loses power during an event.
+
+<Aside type="tip" title="Event Logic">
+When the `earthquake_event` is set, the writer overrides the 30-minute timer and schedules a flush exactly **5 minutes** from the trigger time. This delay ensures the entire earthquake is captured in the buffer before writing.
+</Aside>
+
+---
+
+## Storage & Performance
+
+MiniSEED uses **Steim-2 compression**, which is lossless and highly efficient for seismic integer data.
+
+### Capacity Estimates (3 Channels @ 100Hz)
+
+| Metric | Raw Data (int32) | Steim-2 (Compressed) |
+| :--- | :--- | :--- |
+| **Per Hour** | ~4.3 MB | ~2.1 MB |
+| **Per Day** | ~104 MB | **~51 MB** |
+| **Per Month** | ~3.1 GB | ~1.5 GB |
+
+### Resource Usage
+- **Memory:** ~2.2 MB (for a full 30-minute buffer).
+- **IO Latency:** ~200ms during a "Merge" operation (Reading existing file + Writing back).
+
+---
+
+## Error Recovery
+
+- **Disk Full:** If an `OSError` occurs during write, the error is logged as `CRITICAL`. The current buffer is cleared to prevent memory exhaustion, though that specific 30-minute block of data is lost.
+- **Corrupt Files:** If an existing day-file cannot be read for merging, the writer logs an error and attempts to overwrite it with the current buffer to resume recording.
