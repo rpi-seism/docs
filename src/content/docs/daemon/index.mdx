@@ -1,5 +1,5 @@
 ---
-title: rpi-seism Daemon
+title: RPI-Seism Daemon
 description: Multi-threaded Python application for seismic data acquisition and processing.
 sidebar:
   label: Overview
@@ -8,7 +8,7 @@ sidebar:
 
 import { Card, CardGrid, Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The **rpi-seism daemon** is the central nervous system of the project. It is a high-performance, multi-threaded Python application designed to acquire, process, store, and broadcast triaxial seismic data in real-time.
+The **RPI-Seism daemon** is the central nervous system of the project. It is a high-performance, multi-threaded Python application designed to acquire, process, store, and broadcast triaxial seismic data in real-time.
 
 <Aside type="tip">
   Optimized for **Python 3.13+** and tested on Raspberry Pi OS (Debian Bookworm).
@@ -37,10 +37,10 @@ The daemon acts as the bridge between raw hardware signals and high-level data a
   <Card title="Standardized Storage" icon="document">
     Writes to **SDS (SeisComP Data Structure)** in MiniSEED format with automatic midnight splits.
   </Card>
-  <Card title="Live Streaming" icon="external-link">
+  <Card title="Live Streaming" icon="seti:odata">
     Websocket server (ws://8765) broadcasting 4× decimated (25 Hz) filtered data.
   </Card>
-  <Card title="Smart Alerts" icon="notification">
+  <Card title="Smart Alerts" icon="information">
     Integrated STA/LTA trigger engine with Apprise support (Telegram, Email, etc.).
   </Card>
 </CardGrid>
@@ -96,12 +96,3 @@ The daemon utilizes five concurrent threads to ensure no data loss during heavy 
 - **Format:** MiniSEED (FDSN compliant).
 - **Metadata:** Auto-generated **StationXML** with pole-zero instrument response.
 - **Structure:** SeisComP Data Structure (SDS) `YEAR/NET/STA/CHAN.D/`.
-
----
-
-## Next Steps
-
-<CardGrid>
-  <linkCard title="Hardware Protocol" href="/daemon/serial-protocol" description="Deep dive into the 16-byte RS-422 packet format." />
-  <linkCard title="Configuration Guide" href="/daemon/configuration" description="How to tune STA/LTA thresholds and ADC gain." />
-</CardGrid>

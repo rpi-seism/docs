@@ -1,26 +1,54 @@
 ---
-title: Welcome to Starlight
-description: Get started building your docs site with Starlight.
-template: splash # Remove or comment out this line to display the site sidebar on this page.
+title: RPI-Seism Documentation
+description: Low-latency seismic monitoring, data acquisition, and real-time alerting.
+template: splash
 hero:
-  tagline: Congrats on setting up a new Starlight project!
+  tagline: A complete ecosystem for Raspberry Pi seismic monitoring, from 24-bit ADC sampling to FDSN-compliant archiving.
+  image:
+    file: ../../assets/houston.webp # Replace with your logo if you have one
   actions:
-    - text: Daemon
-      link: /docs/daemon/
+    - text: System Architecture
+      link: /docs/daemon/system-architecture/
       icon: right-arrow
-    - text: MCU
-      link: /docs/mcu/
-      icon: right-arrow
-    - text: API
-      link: /docs/api/
-      icon: right-arrow
-    - text: Read the Starlight docs
-      link: https://starlight.astro.build
+      variant: primary
+    - text: View GitHub
+      link: https://github.com/rpi-seism
       icon: external
       variant: minimal
 ---
 
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
-## Next steps
+## Explore the System
 
+<CardGrid stagger>
+	<Card title="The Daemon" icon="setting">
+		The Python-based heart of the system. Manages the **Reader**, **Trigger**, and **Writer** threads. 
+		[Explore Daemon Docs](/docs/daemon/system-architecture/)
+	</Card>
+	<Card title="MCU Firmware" icon="seti:cpp">
+		High-performance C++ code for the ADS1256 ADC, ensuring precise timing and low-jitter sampling.
+		[View MCU Logic](/docs/mcu/)
+	</Card>
+	<Card title="Hardware & Wiring" icon="seti:config">
+		Detailed pinout diagrams for Raspberry Pi GPIO, ADS1256 integration, and RS-422 differential signaling setup.
+		[Build the Station](/docs/setup/hardware/)
+	</Card>
+	<Card title="Real-time API" icon="random">
+		FastAPI-powered endpoint for live waveform streaming and historical MiniSEED retrieval.
+		[API Reference](/docs/api/)
+	</Card>
+	<Card title="StationXML" icon="document">
+		Automatically generated metadata and epoch management for FDSN-compliant data processing.
+		[Learn about Response Stages](/docs/daemon/advanced/station-xml/)
+	</Card>
+</CardGrid>
+
+---
+
+## Quick Start for Developers
+
+1. **Clone the repository:** `git clone https://github.com/rpi-seism/daemon`
+2. **Install dependencies:** `uv sync`
+3. **Configure your sensor:** Edit `config.yml` with your network and station codes.
+4. **Run the system:** `uv run rpi-seism`

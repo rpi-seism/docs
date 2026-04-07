@@ -10,7 +10,7 @@ export default defineConfig({
 	site: 'https://rpi-seism.github.io',
 	base: '/docs',
 	trailingSlash: 'always',
-	
+
 	integrations: [
 		starlight({
 			title: 'RPI-Seism',
@@ -47,6 +47,13 @@ export default defineConfig({
 					],
 				},
 				{
+					label: 'Hardware',
+					items: [
+						// Each item here is one entry in the navigation menu.
+						{ label: 'Hardware Docs', slug: 'hardware' },
+					],
+				},
+				{
 					label: 'MCU',
 					items: [
 						// Each item here is one entry in the navigation menu.
@@ -59,11 +66,7 @@ export default defineConfig({
 						// Each item here is one entry in the navigation menu.
 						{ label: 'API Docs', slug: 'api' },
 					],
-				},
-				{
-					label: 'Reference',
-					autogenerate: { directory: 'reference' },
-				},
+				}
 			],
 
 			customCss: ['./src/mathjax.css'],
