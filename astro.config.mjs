@@ -9,6 +9,8 @@ import rehypeMathJax from 'rehype-mathjax';
 export default defineConfig({
 	site: 'https://rpi-seism.github.io',
 	base: '/docs',
+	trailingSlash: 'always',
+	
 	integrations: [
 		starlight({
 			title: 'RPI-Seism',
