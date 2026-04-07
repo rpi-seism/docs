@@ -7,7 +7,7 @@ import rehypeMathJax from 'rehype-mathjax';
 
 // https://astro.build/config
 export default defineConfig({
-	site: 'https://rpi-seism.github.io/',
+	site: 'https://rpi-seism.github.io',
 	base: '/docs',
 	integrations: [
 		starlight({
