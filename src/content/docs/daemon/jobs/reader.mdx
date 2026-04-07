@@ -1,0 +1,80 @@
+---
+title: Reader Thread
+description: Technical breakdown of the serial data acquisition engine and RS-422 protocol.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Steps, Aside, Card } from '@astrojs/starlight/components';
+
+The **Reader** thread is the primary data acquisition engine. It continuously pulls RS-422 serial packets from the MCU, validates their integrity via CRC-32, and distributes samples to downstream consumers.
+
+## Architecture
+
+The Reader acts as a **Single Producer**, feeding four **Concurrent Consumers** via thread-safe queues.
+
+
+
+- **Input:** RS-422 Serial Stream (250,000 bps)
+- **Outputs:** - `msed_writer_queue` (Archival)
+    - `websocket_queue` (Live Dashboard)
+    - `trigger_queue` (Earthquake Detection)
+    - `notifier_queue` (Alerts)
+
+---
+
+## Initialization
+
+The thread is initialized with the global settings and a reference to the shared `shutdown_event`.
+
+<Tabs>
+  <TabItem label="Constructor Parameters">
+    | Parameter | Type | Description |
+    | :--- | :--- | :--- |
+    | `settings` | `Settings` | Pydantic model containing serial port/baudrate. |
+    | `queues` | `list[Queue]` | The four downstream distribution queues. |
+    | `shutdown_event` | `Event` | Global signal to stop processing. |
+  </TabItem>
+  
+  <TabItem label="Internal State">
+    | Variable | Type | Purpose |
+    | :--- | :--- | :--- |
+    | `port` | `str` | e.g., `/dev/ttyUSB0` |
+    | `last_heartbeat` | `float` | Tracks the 500ms heartbeat timer. |
+    | `buffer` | `bytearray` | Sliding window for packet alignment. |
+  </TabItem>
+</Tabs>
+
+---
+
+## The Handshake Protocol
+
+Before streaming begins, the Reader must synchronize settings with the MCU. If this fails, the daemon aborts to prevent data with incorrect sample rates or gains from being recorded.
+
+<Steps>
+1. **Serial Connection:** Opens the port. Note that opening the serial port often triggers a hardware reset on the MCU.
+2. **Boot Delay:** Waits 2 seconds for the MCU to initialize its internal registers.
+3. **Transmit Settings:** Sends a 6-byte `MCUSettingsFrame` containing the requested `sampling_rate`, `gain`, and `adc_sample_rate`.
+4. **Echo Verification:** Waits up to 10 seconds for the MCU to echo the exact same 6 bytes back.
+5. **Validation:** If the echo matches, streaming starts; otherwise, the daemon raises `MCUNoResponse` and exits.
+</Steps>
+
+---
+
+## Main Loop Logic
+
+The thread runs a high-frequency loop that performs three primary tasks:
+
+### 1. Heartbeat Generation
+To prevent the MCU from streaming data into a "dead" serial port, the MCU pauses if it doesn't see a heartbeat.
+- **Frequency:** Every 500ms.
+- **Payload:** A single byte `0x01`.
+
+### 2. Packet Alignment
+If the serial stream is interrupted, the Reader may find itself in the middle of a packet. It uses a sliding window to find the next valid header.
+```python
+# Sliding window logic
+if buffer[0] == 0xAA and buffer[1] == 0xBB:
+    # Potential packet found
+else:
+    del buffer[0] # Shift 1 byte and try again
