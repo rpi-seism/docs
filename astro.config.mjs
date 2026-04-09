@@ -57,14 +57,24 @@ export default defineConfig({
 					label: 'MCU',
 					items: [
 						// Each item here is one entry in the navigation menu.
-						{ label: 'MCU Docs', slug: 'mcu' },
+						{ label: 'Overview', slug: 'mcu' },
+						{ label: 'Packet Protocol', slug: 'mcu/packet-protocol' },
+						{ label: 'ADS1256 Sampling', slug: 'mcu/adc-sampling' },
+						{ label: 'Platforms & Build', slug: 'mcu/platforms' },
 					],
 				},
 				{
 					label: 'API',
 					items: [
 						// Each item here is one entry in the navigation menu.
-						{ label: 'API Docs', slug: 'api' },
+						{ label: 'Overview', slug: 'api' },
+						{
+							label: 'Routers',
+							items: [
+								{ label: 'Archive Router', slug: 'api/routers/archive' },
+								{ label: 'Bookmarks Router', slug: 'api/routers/bookmarks' },
+							]
+						},
 					],
 				}
 			],

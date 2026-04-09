@@ -1,0 +1,132 @@
+---
+title: Packet Protocol
+description: Binary packet specification for the MCU↔daemon RS-422 link.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
+
+The firmware communicates with the daemon over a **fixed-length binary protocol**. There are two packet types: the high-frequency **ADC Data** packet and the one-shot **Settings Handshake**.
+
+---
+
+## Packet Type 1 — ADC Data
+
+**Emitted at:** configured sample rate (default 100 Hz)  
+**Length:** 18 bytes
+
+### Structure
+
+| Offset | Bytes | Type | Field | Value |
+| :--- | :--- | :--- | :--- | :--- |
+| 0 | 1 | `uint8` | `header_1` | `0xAA` |
+| 1 | 1 | `uint8` | `header_2` | `0xBB` |
+| 2 | 4 | `int32_le` | `ch0` | Vertical (Z) — signed 24-bit, sign-extended |
+| 6 | 4 | `int32_le` | `ch1` | North (N) |
+| 10 | 4 | `int32_le` | `ch2` | East (E) |
+| 14 | 4 | `uint32_le` | `crc` | CRC-32 of bytes 0–13 |
+
+### Python parsing (daemon)
+
+```python
+import struct
+from binascii import crc32
+
+PACKET_FORMAT = "<BBiiiI"  # 18 bytes
+PACKET_SIZE   = struct.calcsize(PACKET_FORMAT)  # → 18
+
+header_1, header_2, ch0, ch1, ch2, rx_crc = struct.unpack(PACKET_FORMAT, data)
+
+payload     = data[:-4]
+calc_crc    = crc32(payload) & 0xFFFFFFFF
+valid       = (calc_crc == rx_crc)
+```
+
+### ADC value range
+
+The ADS1256 outputs a signed 24-bit integer, sign-extended to 32 bits before packing:
+
+| Code | Value |
+| :--- | :--- |
+| `0x007FFFFF` | +8,388,607 (positive full-scale) |
+| `0x00000000` | Zero (ground) |
+| `0xFF800000` | −8,388,608 (negative full-scale) |
+
+---
+
+## Packet Type 2 — Settings Handshake
+
+**Emitted:** once by the daemon on startup; echoed back by the MCU.  
+**Length:** 6 bytes
+
+### Structure
+
+| Offset | Bytes | Type | Field | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| 0 | 1 | `uint8` | `header_1` | `0xCC` |
+| 1 | 1 | `uint8` | `header_2` | `0xDD` |
+| 2 | 2 | `uint16_le` | `sampling_speed` | Target output rate in Hz |
+| 4 | 1 | `uint8` | `adc_gain` | PGA enum (0–6) |
+| 5 | 1 | `uint8` | `adc_data_rate` | ADS1256 DRATE enum (0–15) |
+
+<Aside type="note" title="No checksum on the settings packet">
+  The settings packet uses an **XOR** byte-checksum (daemon side legacy). The MCU verifies the echo by comparing the received 6 bytes byte-for-byte against what it sent — an implicit check that is sufficient for a one-shot startup exchange.
+</Aside>
+
+### Handshake sequence
+
+<Steps>
+1. Daemon opens the serial port (this may reset AVR/STM32 boards via DTR).
+2. Daemon waits **2 s** for the MCU to finish booting and initialise the ADS1256 registers.
+3. Daemon transmits the 6-byte `MCUSettingsFrame`.
+4. MCU applies the settings and echoes the identical 6 bytes.
+5. Daemon waits up to **10 s**, scanning for the `0xCC 0xDD` header to align the response.
+6. If the echo matches → streaming starts.  
+   If no echo within 10 s → `MCUNoResponse` exception, daemon exits.
+</Steps>
+
+### Python struct format
+
+```python
+PACKET_FORMAT = "<BBHBB"  # 6 bytes
+struct.pack(PACKET_FORMAT, 0xCC, 0xDD, sampling_rate, adc_gain, adc_data_rate)
+```
+
+---
+
+## Heartbeat
+
+The daemon sends a single byte `0x01` every **500 ms** to prove the link is alive. The MCU pauses streaming if no heartbeat arrives within ~1 s, preventing the UART TX buffer from overflowing into a dead host.
+
+---
+
+## Buffer alignment
+
+If the RS-422 link is noisy or the daemon restarts mid-packet, the receive buffer will be misaligned. The daemon uses a sliding-window strategy to re-sync:
+
+```python
+while len(buffer) >= PACKET_SIZE:
+    if buffer[0] == 0xAA and buffer[1] == 0xBB:
+        process_packet(buffer[:PACKET_SIZE])
+        del buffer[:PACKET_SIZE]
+    else:
+        del buffer[0]  # shift one byte and try again
+```
+
+A CRC failure also causes the daemon to discard only that packet and keep looking — it does **not** flush the whole buffer.
+
+---
+
+## Baud rate & timing
+
+At 250,000 bps (8-N-1) transmitting 18 bytes:
+
+| Stage | Time |
+| :--- | :--- |
+| Packet TX (144 bits) | 0.576 ms |
+| USB-Serial adapter latency | ~0.2 ms |
+| Daemon parse + queue | ~0.1 ms |
+| **Total latency** | **~0.88 ms** |
+| **Budget at 100 Hz** | **10 ms** |
+| **Headroom** | **~9.1 ms** |

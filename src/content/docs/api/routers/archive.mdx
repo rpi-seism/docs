@@ -1,0 +1,214 @@
+---
+title: Archive Router
+description: Endpoints for browsing the SDS archive, fetching waveforms, and exporting data.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Aside, Steps, Card } from '@astrojs/starlight/components';
+
+The `/archive` router provides read-only access to the **SeisComp Data Structure (SDS)** archive written by the daemon's `MSeedWriter` thread. All heavy lifting is done inside the `ArchiveHelper` class, which is shared across endpoints.
+
+---
+
+## `GET /archive/health`
+
+Liveness check. Returns the resolved SDS and StationXML paths and whether they exist on disk.
+
+**No parameters.**
+
+---
+
+## `GET /archive/channels`
+
+Scan the SDS tree and return every distinct channel code present for the configured network/station.
+
+**Response:** `string[]` — e.g. `["EHE","EHN","EHZ"]`
+
+```http
+GET /archive/channels
+→ 200 ["EHE","EHN","EHZ"]
+→ 404 {"detail":"No channels found in archive"}
+→ 503 {"detail":"SDS root not found: …"}
+```
+
+---
+
+## `GET /archive/days`
+
+Return ISO dates (`YYYY-MM-DD`) for which at least one SDS day file exists for the requested channel.
+
+| Parameter | Type | Required | Description |
+| :--- | :--- | :--- | :--- |
+| `channel` | string | ✅ | Channel code, e.g. `EHZ` |
+
+**Response:** `string[]` sorted oldest-first — e.g. `["2026-01-01","2026-01-02"]`
+
+---
+
+## `GET /archive/waveform`
+
+Single-channel waveform fetch with optional instrument-response removal.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `channel` | — | Channel code |
+| `start` | — | ISO-8601 start time |
+| `end` | — | ISO-8601 end time |
+| `units` | `COUNTS` | `COUNTS` \| `VEL` \| `DISP` \| `ACC` |
+| `max_pts` | `4000` | Max display points (100–20,000) |
+
+<Aside type="note">
+  Kept for backwards compatibility. Prefer `/archive/waveforms` for multi-channel queries.
+</Aside>
+
+**Response shape:**
+
+```json
+{
+  "channel":      "EHZ",
+  "network":      "XX",
+  "station":      "RPI3",
+  "units":        "counts",
+  "fs":           25.0,
+  "starttime":    "2026-04-01T00:00:00.000000Z",
+  "endtime":      "2026-04-01T00:05:00.000000Z",
+  "npts_raw":     30000,
+  "npts_display": 4000,
+  "data":         [12345, 12346, …]
+}
+```
+
+---
+
+## `GET /archive/waveforms`
+
+Multi-channel waveform fetch. All channels are read **concurrently** using `asyncio.gather`; latency is bounded by the slowest channel, not the sum.
+
+Channels with missing data are reported in `errors` without aborting the whole request.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `channels` | — | Repeat param: `?channels=EHZ&channels=EHN` |
+| `start` | — | ISO-8601 start |
+| `end` | — | ISO-8601 end |
+| `units` | `COUNTS` | `COUNTS` \| `VEL` \| `DISP` \| `ACC` |
+| `max_pts` | `4000` | Per-channel display point cap |
+
+**Response shape:**
+
+```json
+{
+  "results": [ { …waveform… }, { …waveform… } ],
+  "errors":  [ { "channel": "EHE", "detail": "No data for EHE …" } ]
+}
+```
+
+<Aside type="tip" title="Thread safety">
+  Each concurrent fetch creates its own `SDSClient` instance. The ObsPy SDS client is **not thread-safe** when shared, so per-call instantiation is intentional.
+</Aside>
+
+---
+
+## `GET /archive/export_waveforms`
+
+Export a time window in one of four formats, packaged as a ZIP archive.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `channels` | — | Repeat param (same as `/waveforms`) |
+| `start` | — | ISO-8601 start |
+| `end` | — | ISO-8601 end |
+| `units` | `COUNTS` | Same options as `/waveforms` |
+| `fmt` | `mseed` | `mseed` \| `sac` \| `csv` \| `json` |
+
+**Response:** `application/zip` with one file per channel.
+
+<Tabs>
+  <TabItem label="mseed">
+    Full-resolution MiniSEED trimmed to the requested window. Opens in ObsPy, SeisComP, or any FDSN-compliant tool. Record length: **512 bytes** (Steim-2 compatible).
+  </TabItem>
+  <TabItem label="sac">
+    SAC binary with header metadata. The first trace after merge is exported. Suitable for SAC, TauP, and ObsPy.
+  </TabItem>
+  <TabItem label="csv">
+    One row per sample: `time_utc,<channel>_<unit>`. No decimation — full resolution. Opens in Excel, MATLAB, or Python.
+  </TabItem>
+  <TabItem label="json">
+    Same structure as `/waveform` response with peak-preserving decimation applied (max 4000 points).
+  </TabItem>
+</Tabs>
+
+---
+
+## `GET /archive/events`
+
+Return SDS day-file metadata records for a specific channel and date.
+
+| Parameter | Default | Description |
+| :--- | :--- | :--- |
+| `channel` | — | Channel code |
+| `date` | — | `YYYY-MM-DD` |
+| `limit` | `100` | Max records to return (1–1000) |
+
+**Response:** `list[{date, channel, filename, size_kb}]`
+
+---
+
+## `GET /archive/download`
+
+Stream a raw MiniSEED day file directly to the browser as a download.
+
+| Parameter | Description |
+| :--- | :--- |
+| `channel` | Channel code |
+| `date` | `YYYY-MM-DD` |
+
+**Response:** `application/octet-stream` — the unmodified SDS day file.
+
+---
+
+## Instrument Response Removal
+
+When `units` is anything other than `COUNTS`, the API applies a full deconvolution pipeline on the server before returning data:
+
+<Steps>
+1. **Demean** — remove DC offset that would blow up in the frequency domain.
+2. **5 % cosine taper** — suppress Gibbs ringing at trace edges.
+3. **`remove_response`** — divide by the PAZ + ADC transfer function using a cosine pre-filter.
+4. **SI → nm conversion** — multiply by `1e9` to avoid tiny floats on the Y axis.
+</Steps>
+
+**Pre-filter corners (Hz):** `(0.5, 1.0, 45.0, 48.0)` — zero below 0.5 Hz, full pass 1–45 Hz, zero above 48 Hz.
+
+**Water level:** 60 dB — stabilises division near the zeros of the response.
+
+The `station.xml` inventory is cached in memory and re-read from disk only when the file's `mtime` changes, so epoch updates take effect on the next request without an API restart.
+
+---
+
+## Hard Limits
+
+| Limit | Value |
+| :--- | :--- |
+| Max samples per request | 200,000 |
+| Max time window | 6 hours |
+| Max display points (decimated) | 20,000 |
+| Peak-decimation target (export JSON) | 4,000 |
+
+Requests that exceed these limits receive a `400 Bad Request` with an explanatory message.
+
+---
+
+## Peak-Preserving Decimation
+
+For display endpoints the API uses **peak-preserving decimation** rather than a low-pass filter downsample. In each chunk the sample with the largest absolute value is retained, ensuring earthquake peaks survive visualization even at aggressive decimation ratios.
+
+```python
+factor = int(len(data) / target)
+chunks = data[:trim].reshape(-1, factor)
+idx    = np.argmax(np.abs(chunks), axis=1)
+return chunks[np.arange(len(chunks)), idx]
+```
+
+This is intentionally different from the daemon's anti-alias decimation — for *display* you want extremes preserved, not smoothed away.

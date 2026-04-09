@@ -1,0 +1,145 @@
+---
+title: Bookmarks Router
+description: CRUD API for persisting named seismic time-window bookmarks in SQLite.
+sidebar:
+  order: 3
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The `/bookmarks` router provides full **Create / Read / Update / Delete** access to the bookmark store — a lightweight SQLite database managed by [SQLModel](https://sqlmodel.tiangolo.com/) and [Alembic](https://alembic.sqlalchemy.org/).
+
+A **bookmark** is a named snapshot of a waveform view: it captures the channel list, time window, and display units so the user can jump straight back to any interesting event from the web UI.
+
+---
+
+## Data Model
+
+<Tabs>
+  <TabItem label="Database (Bookmark)">
+    | Column | Type | Notes |
+    | :--- | :--- | :--- |
+    | `id` | `TEXT` (PK) | UUID v4, generated server-side |
+    | `label` | `TEXT` | User-defined name, e.g. `"possible M2.1"` |
+    | `channels` | `TEXT` | Comma-separated SEED codes: `"EHZ,EHN"` |
+    | `start` | `DATETIME` | UTC start of the bookmarked window |
+    | `end` | `DATETIME` | UTC end of the bookmarked window |
+    | `units` | `TEXT` | `COUNTS` \| `VEL` \| `DISP` \| `ACC` |
+    | `saved_at` | `DATETIME` | Server-side creation timestamp (UTC) |
+  </TabItem>
+  <TabItem label="API response (BookmarkPublic)">
+    Identical fields, but `channels` is **deserialized** to a `string[]` before being sent to the client:
+
+    ```json
+    {
+      "id":       "a1b2c3d4-…",
+      "label":    "possible M2.1",
+      "channels": ["EHZ", "EHN"],
+      "start":    "2026-04-01T10:23:00",
+      "end":      "2026-04-01T10:28:00",
+      "units":    "VEL",
+      "saved_at": "2026-04-01T10:30:00.123456"
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## `GET /bookmarks/`
+
+Return all bookmarks ordered newest-first (`saved_at DESC`).
+
+**No parameters.**
+
+**Response:** `BookmarkPublic[]`
+
+---
+
+## `POST /bookmarks/`
+
+Create a new bookmark.
+
+**Request body (`BookmarkCreate`):**
+
+```json
+{
+  "label":    "teleseismic P-wave",
+  "channels": ["EHZ"],
+  "start":    "2026-04-01T10:23:00",
+  "end":      "2026-04-01T10:28:00",
+  "units":    "VEL"
+}
+```
+
+| Field | Required | Notes |
+| :--- | :--- | :--- |
+| `label` | ✅ | Falls back to `"{start}"` if blank |
+| `channels` | ✅ | `string[]` — at least one SEED code |
+| `start` | ✅ | ISO-8601 datetime |
+| `end` | ✅ | ISO-8601 datetime |
+| `units` | ✅ | Must match one of the four valid unit strings |
+
+**Response:** `BookmarkPublic` (201 Created)
+
+---
+
+## `PATCH /bookmarks/{bookmark_id}`
+
+Partial update — any combination of fields may be omitted. Useful for renaming a bookmark from the inline editor in the web UI.
+
+**Path param:** `bookmark_id` — UUID string
+
+**Request body (`BookmarkUpdate`, all optional):**
+
+```json
+{ "label": "confirmed M2.1 — udine" }
+```
+
+**Response:** Updated `BookmarkPublic`
+
+**Error:** `404` if `bookmark_id` not found.
+
+---
+
+## `DELETE /bookmarks/{bookmark_id}`
+
+Permanently delete a single bookmark.
+
+**Path param:** `bookmark_id` — UUID string
+
+**Response:**
+
+```json
+{ "deleted": "a1b2c3d4-…" }
+```
+
+**Error:** `404` if not found.
+
+<Aside type="caution" title="Bulk delete">
+  The API has no bulk-delete endpoint. The web dashboard's "Delete all filtered" action fires individual `DELETE` requests in parallel — one per bookmark in the filtered list.
+</Aside>
+
+---
+
+## Storage & Migrations
+
+The database file is created automatically on first run. Run Alembic migrations whenever you pull a new version:
+
+```bash
+cd app
+alembic upgrade head
+```
+
+Current migration chain:
+
+| Revision | Description |
+| :--- | :--- |
+| `8cd7b1d2eb13` | Initial `bookmark` table |
+| `0697a8162520` | Remove `date` column (redundant with `start`) |
+
+The `DB_PATH` environment variable overrides the default `./data/database.db`, which is required when running the API inside Docker with a volume-mounted data directory:
+
+```bash
+export DB_PATH=/data/database.db
+```

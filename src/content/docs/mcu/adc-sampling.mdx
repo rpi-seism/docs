@@ -1,0 +1,101 @@
+---
+title: ADS1256 Sampling
+description: How the firmware drives the ADS1256 ADC to multiplex three geophone channels without timing jitter.
+sidebar:
+  order: 3
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The **ADS1256** is a 24-bit delta-sigma ADC with an internal 8-channel MUX. The firmware uses it in **differential mode** to read three geophone channels and packs the results into the RS-422 data stream at the configured sample rate.
+
+---
+
+## Channel Assignment
+
+| ADS1256 Differential Pair | SEED Channel | Geophone Orientation |
+| :--- | :--- | :--- |
+| AIN0 / AIN1 | EHZ | Vertical |
+| AIN2 / AIN3 | EHN | North–South |
+| AIN4 / AIN5 | EHE | East–West |
+
+Channel assignments are defined in `config.yml` via the `adc_channel` field (0, 1, 2) and are pushed to the MCU at startup as part of the Settings Handshake.
+
+---
+
+## The 4-Call MUX Cycle
+
+The ADS1256 has a **one-conversion pipeline delay**: when you write a new MUX register the change takes effect on the *next* conversion, not the current one. This means a naive 3-call loop would read:
+
+```
+Call 1 → MUX=Z → ADC still settling from previous → WRONG
+Call 2 → MUX=N → reads Z
+Call 3 → MUX=E → reads N
+```
+
+The firmware solves this with four calls per output sample, discarding the last result:
+
+<Steps>
+1. `cycleDifferential(AIN0/AIN1)` — MUX set to Z; ADC returns **previous channel** (discard on very first loop).
+2. `cycleDifferential(AIN2/AIN3)` — MUX set to N; ADC returns **Z** ✅.
+3. `cycleDifferential(AIN4/AIN5)` — MUX set to E; ADC returns **N** ✅.
+4. `cycleDifferential(AIN0/AIN1)` — MUX back to Z; ADC returns **E** ✅. Discard this result.
+</Steps>
+
+After the 4th call the MUX is primed at channel 0 again, and the cycle repeats cleanly.
+
+<Aside type="danger" title="Never average on the MCU">
+  The ADS1256's internal sinc³ filter already performs anti-alias decimation at the hardware level. Applying a software box-filter average on top would degrade the frequency response and introduce a poor rectangular-window roll-off. **Always transmit raw samples.** Decimation and filtering belong in the daemon.
+</Aside>
+
+---
+
+## Timing Budget
+
+The ADS1256 output data rate (`DRATE`) must be fast enough to complete three differential conversions within one output sample period.
+
+Each conversion takes `1 / DRATE` seconds. With 3 channels (plus the discard call = 4 total) and a 10 % SPI overhead margin:
+
+$$t_\text{cycle} = \frac{4}{f_\text{DRATE}} \times 1.10 \leq \frac{1}{f_\text{output}}$$
+
+Rearranging: $f_\text{DRATE} \geq f_\text{output} \times 4 \times 1.10 \approx f_\text{output} \times 4.4$
+
+The settings validator in `rpi-seism-common` enforces the stricter **×13 rule** (9 filter cycles × 1.10 safety margin → rounds up to 13) to guarantee stable settling:
+
+| Output rate | Minimum DRATE | Recommended setting |
+| :--- | :--- | :--- |
+| 100 Hz | 1300 SPS | `DRATE_2000SPS` (index 11) |
+| 200 Hz | 2600 SPS | `DRATE_3750SPS` (index 12) |
+| 500 Hz | 6500 SPS | `DRATE_7500SPS` (index 13) |
+
+---
+
+## PGA (Programmable Gain Amplifier)
+
+The ADS1256 includes an integrated PGA that sets the input voltage range. For the **GD-4.5 + LT1167** signal chain with ~×5.5 analog gain, the geophone signal rarely exceeds ±20 mV. The default setting is:
+
+| Enum | Index | Input range | Use with |
+| :--- | :--- | :--- | :--- |
+| `PGA_64` | 6 | ±78.125 mV | GD-4.5 + LT1167 (~×5.5 gain) |
+| `PGA_32` | 5 | ±156 mV | GD-4.5 direct or low-gain amp |
+| `PGA_8`  | 3 | ±625 mV | High-output piezo sensors |
+
+<Aside type="tip">
+  If a proposed rev2 FDA stage (ADA4932-1, ×100) is fitted, drop to `PGA_1` (±5 V) or `PGA_2` (±2.5 V) since the amplifier will already be driving the ADC near full-scale.
+</Aside>
+
+---
+
+## VREF
+
+The ADS1256 reference voltage directly sets the ADC full-scale range and appears in the StationXML sensitivity calculation:
+
+$$\text{Counts/V} = \frac{\text{PGA} \times 2^{23}}{V_\text{ref}}$$
+
+The default `vref = 2.5 V` with `PGA_64` yields approximately **215,384,678 counts/V** before the instrument sensitivity factor.
+
+---
+
+## Self-Calibration
+
+On startup (before the first reading) the firmware should trigger an ADS1256 **self-calibration** (`SELFCAL` command) to zero out internal offset and gain errors. This is particularly important after power-on temperature transients. The calibration takes ~2 ms at 2000 SPS and is invisible to the daemon due to the 2 s boot delay in the handshake sequence.

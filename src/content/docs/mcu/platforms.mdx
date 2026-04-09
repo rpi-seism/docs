@@ -1,0 +1,176 @@
+---
+title: Platforms & Build
+description: PlatformIO build targets, platform-specific notes, and how to flash the firmware.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
+
+The firmware is built with **PlatformIO** using the Arduino framework. A single `platformio.ini` defines multiple environments — one per MCU family — so you can target any supported board without touching the source.
+
+---
+
+## Quick Start
+
+<Steps>
+1. Install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html) or the VS Code extension.
+2. Clone the firmware repository:
+   ```bash
+   git clone https://github.com/rpi-seism/reader.git
+   cd reader
+   ```
+3. Select your target environment and build:
+   ```bash
+   # STM32 (recommended)
+   pio run -e stm32 -t upload
+
+   # RP2040
+   pio run -e rp2040 -t upload
+
+   # ESP32
+   pio run -e esp32 -t upload
+   ```
+</Steps>
+
+---
+
+## `platformio.ini` Environments
+
+<Tabs>
+  <TabItem label="STM32">
+    ```ini
+    [env:stm32]
+    platform  = ststm32
+    framework = arduino
+    board     = genericSTM32F103C8   ; Blue Pill — swap for your target
+    build_flags =
+        -D PLATFORM_STM32
+        -D SERIAL_RX_BUFFER_SIZE=512
+    lib_deps =
+        robtillaart/CRC@^1.0.0
+    ```
+    **Notes:**
+    - `HAL_NVIC_SystemReset()` is available on all STM32 families.
+    - Hardware UART1 is used for RS-422; USB virtual COM is available for debug.
+    - The MAX490E DE/RE pins must be toggled around each transmission burst.
+  </TabItem>
+  <TabItem label="RP2040">
+    ```ini
+    [env:rp2040]
+    platform  = raspberrypi
+    framework = arduino
+    board     = pico
+    build_flags =
+        -D PLATFORM_RP2040
+    lib_deps =
+        robtillaart/CRC@^1.0.0
+    ```
+    **Notes:**
+    - Programmable I/O (PIO) gives jitter-free SPI timing, ideal for the ADS1256.
+    - Use `Serial1` for RS-422; `Serial` (USB) for debug.
+    - Reset is via `watchdog_reboot(0, 0, 0)` or `rp2040.reboot()`.
+  </TabItem>
+  <TabItem label="ESP32">
+    ```ini
+    [env:esp32]
+    platform  = espressif32
+    framework = arduino
+    board     = esp32dev
+    build_flags =
+        -D PLATFORM_ESP32
+    lib_deps =
+        robtillaart/CRC@^1.0.0
+    ```
+    **Notes:**
+    - Use `HardwareSerial Serial2(2)` for RS-422.
+    - Wi-Fi interference can add jitter to SPI — disable Wi-Fi if not needed.
+    - `ESP.restart()` is the reset function.
+    - OTA updates are possible via the Arduino OTA library.
+  </TabItem>
+  <TabItem label="AVR (Uno/Nano)">
+    ```ini
+    [env:avr_uno]
+    platform  = atmelavr
+    framework = arduino
+    board     = uno
+    lib_deps =
+        robtillaart/CRC@^1.0.0
+    ```
+    **Notes:**
+    - Only 2 KB of SRAM — keep buffers minimal.
+    - Software Serial is required for RS-422 (hardware UART is used by USB).
+    - Recommended for **prototyping only**; timing jitter is higher than 32-bit targets.
+    - No hardware reset API; use the watchdog timer (`wdt.h`).
+  </TabItem>
+  <TabItem label="Teensy">
+    ```ini
+    [env:teensy40]
+    platform  = teensy
+    framework = arduino
+    board     = teensy40
+    lib_deps =
+        robtillaart/CRC@^1.0.0
+    ```
+    **Notes:**
+    - 600 MHz ARM Cortex-M7 — handles >500 SPS without issue.
+    - Hardware SPI runs up to 40 MHz; use 4 MHz or lower for the ADS1256.
+    - Multiple hardware UARTs available; use `Serial1` or `Serial2` for RS-422.
+  </TabItem>
+</Tabs>
+
+---
+
+## CRC-32 Library
+
+The firmware uses [robtillaart/CRC](https://github.com/RobTillaart/CRC) to compute the **Ethernet/PKZip** polynomial CRC-32, matching the daemon's `binascii.crc32()`:
+
+```cpp
+#include "CRC32.h"
+
+CRC32 crc;
+crc.reset();
+crc.add(packet_buffer, 14);   // header + 3 × int32
+uint32_t checksum = crc.calc();
+memcpy(&packet_buffer[14], &checksum, 4);
+```
+
+---
+
+## Dead-Client Detection
+
+If the RS-422 link goes down (daemon crash, cable fault), the UART TX FIFO eventually overflows. The firmware tracks consecutive TX failures. After a configurable threshold it calls the platform reset function to reinitialise the UART hardware:
+
+```cpp
+// Platform-specific reset
+#if defined(PLATFORM_STM32)
+  HAL_NVIC_SystemReset();
+#elif defined(PLATFORM_ESP32)
+  ESP.restart();
+#elif defined(PLATFORM_RP2040)
+  rp2040.reboot();
+#else
+  wdt_enable(WDTO_15MS);  // AVR watchdog
+  while(1) {}
+#endif
+```
+
+The daemon detects the MCU's absence through its own RX timeout and `in_waiting` heartbeat monitor — both sides recover independently.
+
+---
+
+## SPI Wiring (ADS1256)
+
+| ADS1256 Pin | MCU Pin | Signal |
+| :--- | :--- | :--- |
+| SCLK | SPI CLK | SPI Clock (1–4 MHz) |
+| DIN | SPI MOSI | Data to ADC |
+| DOUT | SPI MISO | Data from ADC |
+| CS | GPIO (active low) | Chip Select |
+| DRDY | GPIO (interrupt) | Data Ready (falling edge) |
+| PDWN | 3.3 V | Always powered |
+| RESET | GPIO or VCC | Pull high for normal operation |
+
+<Aside type="caution" title="DRDY polling vs. interrupt">
+  The ADS1256 `DRDY` pin goes low when a new conversion result is ready. The firmware must wait for `DRDY = LOW` before reading; starting an SPI transfer too early returns a stale value. On high-priority targets (STM32, Teensy) use an interrupt; on slower targets (AVR) polling is acceptable.
+</Aside>

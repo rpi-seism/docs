@@ -1,0 +1,78 @@
+---
+title: MCU Firmware
+description: Overview of the multi-platform Arduino firmware for the rpi-seism sensor board.
+sidebar:
+  label: Overview
+  order: 1
+---
+
+import { Card, CardGrid, Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The **rpi-seism firmware** runs on the sensor PCB microcontroller. Its sole job is to drive the **ADS1256 24-bit ADC**, multiplex three geophone channels, and stream validated binary packets to the daemon over **RS-422 at 250 kbps**.
+
+<Aside type="note" title="Build system">
+  The project uses **PlatformIO** with the **Arduino framework**. A single codebase compiles for five MCU families — no forking required.
+</Aside>
+
+---
+
+## Supported Platforms
+
+| Target | Board | Notes |
+| :--- | :--- | :--- |
+| **STM32** | Generic STM32 series | Primary production target |
+| **RP2040** | Raspberry Pi Pico / Pico 2 | Excellent PIO-based SPI |
+| **ESP32** | ESP32 / ESP32-S3 | Wi-Fi can be used for OTA updates |
+| **AVR** | Arduino Uno / Nano | Limited RAM; use for prototyping only |
+| **Teensy** | Teensy 4.0/4.1 | Highest throughput; ideal for >200 SPS |
+
+---
+
+## Key Features
+
+<CardGrid>
+  <Card title="24-bit ADC Sampling" icon="setting">
+    Drives the ADS1256 with hardware SPI. Three differential channels are multiplexed in a fixed Z → N → E → (discard) sequence using `cycleDifferential()`.
+  </Card>
+  <Card title="CRC-32 Integrity" icon="approve-check">
+    Every 18-byte packet carries a CRC-32 checksum over the header and three channel values. The daemon discards packets with mismatches and re-aligns to the next `0xAA 0xBB` header.
+  </Card>
+  <Card title="Runtime Configuration" icon="laptop">
+    Sample rate, ADC gain, and data rate are set at runtime via the **Settings Handshake** — no reflashing required. The MCU echoes the settings packet back for verification.
+  </Card>
+  <Card title="Dead-client Detection" icon="warning">
+    A consecutive-TX-failure counter triggers `HAL_NVIC_SystemReset()` if the daemon stops reading, preventing silent buffer overflow.
+  </Card>
+</CardGrid>
+
+---
+
+## Signal Chain
+
+```
+GD-4.5 Geophone (×3)
+      │
+      ▼
+LT1167 Instrumentation Amplifier (~×5.5 gain)
+      │
+      ▼
+ADS1256 24-bit ADC (differential, 3-channel MUX)
+      │  SPI
+      ▼
+MCU  ──────► MAX490E RS-422 Transceiver ──► Cat5/6 ──► Host PCB ──► Raspberry Pi
+```
+
+---
+
+## Firmware Architecture
+
+The firmware runs a tight superloop (no RTOS). Each iteration:
+
+1. Checks whether a **settings packet** (`0xCC 0xDD`) is waiting in the UART RX buffer and applies it.
+2. Calls `cycleDifferential()` four times — Z, N, E, then a fourth **discarded** cycle to re-sync the ADS1256 MUX (the ADC latches the next channel selection on the previous conversion's completion, so the fourth call advances back to channel 0 cleanly).
+3. Packs the three `int32` values + CRC-32 into an 18-byte frame and writes it to the RS-422 UART.
+4. Checks the heartbeat watchdog — if no `0x01` byte arrives within ~1 s, streaming is paused.
+
+<Aside type="tip" title="Why discard the 4th reading?">
+  The ADS1256 MUX does not change immediately on command — it takes effect one conversion later. Calling `cycleDifferential()` a 4th time (and discarding the result) advances the pipeline back to channel 0, ensuring the next Z-reading is actually from the vertical geophone.
+</Aside>
