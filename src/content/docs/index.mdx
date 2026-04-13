@@ -5,7 +5,7 @@ template: splash
 hero:
   tagline: A complete ecosystem for Raspberry Pi seismic monitoring, from 24-bit ADC sampling to FDSN-compliant archiving.
   image:
-    file: ../../assets/houston.webp # Replace with your logo if you have one
+    file: ../../assets/rpi_seism_icon.svg # Replace with your logo if you have one
   actions:
     - text: System Architecture
       link: /docs/daemon/system-architecture/
@@ -48,7 +48,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 ## Quick Start for Developers
 
-1. **Clone the repository:** `git clone https://github.com/rpi-seism/daemon`
-2. **Install dependencies:** `uv sync`
-3. **Configure your sensor:** Edit `config.yml` with your network and station codes.
-4. **Run the system:** `uv run rpi-seism`
+1. **Clone the repository:** `git clone https://github.com/rpi-seism/stack`
+2. **Install dependencies:** `docker compose up --build -d`
+3. **Configure your sensor:** Edit `data/daemon/config.yml` with your network and station codes.
+4. **Run the system:** `docker compose up --build -d`
