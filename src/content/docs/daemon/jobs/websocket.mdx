@@ -1,79 +1,249 @@
 ---
 title: WebSocket Sender Job
-description: Real-time data streaming, decimation, and signal processing for the web dashboard.
+description: Real-time data streaming, decimation, signal processing, and State-of-Health broadcasting for the web dashboard.
 sidebar:
   order: 3
 ---
 
 import { Tabs, TabItem, Steps, Aside, Card } from '@astrojs/starlight/components';
 
-The **WebSocketSender** broadcasts decimated, filtered seismic data in real-time. It transforms the high-frequency 100 Hz raw stream into a lightweight 25 Hz stream optimized for web-based visualization without overwhelming browser rendering engines.
+The **WebSocketSender** is an `asyncio`-based broadcast server that serves two distinct message types over a single WebSocket connection:
 
-## Architecture
-
-This thread acts as an asynchronous broadcast server, handling multiple concurrent client connections.
-
-
-
-- **Input:** `websocket_queue` (100 Hz Raw ADC counts).
-- **Processing:** Sliding window filtering and decimation.
-- **Output:** JSON payloads via `ws://0.0.0.0:8765`.
+- **Type 0 — Waveform data:** 4× decimated, bandpass-filtered seismic traces at 25 Hz.
+- **Type 1 — State of Health (SOH):** link quality metrics emitted every 5 seconds.
 
 ---
 
-## Signal Processing Pipeline
+## Architecture
 
-To provide a clean "seismic trace" on the dashboard, the data undergoes four stages of processing before broadcast:
+```
+data_queue (100 Hz raw counts)
+      │
+      ▼
+WebSocketSender  ──── per-channel sliding window
+      │                    │
+      │               bandpass filter + decimate
+      │                    │
+      │              broadcast Type 0 (every 1 s)
+      │
+SOHTracker (shared with Reader)
+      │
+  every 5 s
+      │
+broadcast Type 1 (SOH)
+      │
+      ▼
+ws://0.0.0.0:8765
+      ├── Angular dashboard client
+      └── (n clients)
+```
+
+- **Input:** `websocket_queue` (100 Hz raw ADC counts).
+- **Side input:** thread-safe `SOHTracker` updated by the Reader on every packet.
+- **Output:** JSON over WebSocket to all connected clients simultaneously.
+
+---
+
+## Signal Processing Pipeline (Type 0)
+
+To provide a clean seismic trace on the dashboard, each channel's data passes through four stages before broadcast:
 
 <Steps>
-1. **Buffering:** Samples are collected into a **5-second sliding window** (500 samples).
-2. **Filtering:** A 2nd-order Butterworth bandpass filter (**0.2–10 Hz**) is applied to remove DC offset and high-frequency electronic noise.
-3. **Decimation:** The signal is downsampled by a factor of 4 using an anti-aliasing filter, resulting in a **25 Hz** stream.
-4. **Packetization:** The most recent 1 second of processed data (25 samples) is wrapped in a JSON envelope and broadcast to all connected clients.
+1. **Buffering:** Incoming samples are appended to a **5-second sliding window** (`deque(maxlen=window_size)`). Per-channel state is created lazily on first packet.
+2. **Trigger:** Processing fires once per **step size** (= 1 s × sampling rate samples). This means 100 new samples trigger a processing pass for that channel.
+3. **Filtering:** A bandpass filter (**0.2–10 Hz**) is applied to the full 5-second window via ObsPy's `Trace.filter()`. This removes DC offset below 0.2 Hz and high-frequency electronic noise above 10 Hz.
+4. **Decimation:** `Trace.decimate(factor, no_filter=False)` downsamples by the configured `decimation_factor` (default 4), yielding a **25 Hz** output with an additional anti-alias filter applied internally by ObsPy.
+5. **Packetisation:** The most recent `step_size / decimation_factor` (= 25) downsampled samples are extracted and wrapped in a `SamplePayload` JSON envelope.
 </Steps>
 
-
-
 <Aside type="note" title="Why a 5-second window?">
-  Digital filters (specifically IIR filters like Butterworth) require a "settling time" to reach stability. By using a 5-second window, we ensure the center 1-second segment being broadcast is free from filter artifacts and "ringing" at the edges.
+  IIR filters require a settling period to reach steady state. Using a 5-second window and broadcasting only the trailing 1-second slice ensures the output segment is free from filter transients and edge ringing.
 </Aside>
+
+---
+
+## State of Health (Type 1)
+
+### Overview
+
+The `SOHTracker` is a thread-safe dataclass that the **Reader** updates on every received serial byte. The `WebSocketSender` reads it on a 5-second timer and broadcasts the result to all connected clients as a Type 1 message.
+
+This gives the dashboard a live picture of link quality without interfering with the data path.
+
+### SOHTracker Metrics
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `link_quality` | `float` (0–100) | Percentage of bytes that resulted in a valid, checksum-verified packet. Computed as `valid / (valid + errors + dropped) × 100`. |
+| `checksum_errors` | `int` | Packets received with a header match (`0xAA 0xBB`) but a failing CRC-32. |
+| `bytes_dropped` | `int` | Bytes discarded during buffer re-alignment (no header found at expected position). |
+| `last_seen` | `float` | Unix timestamp of the most recently validated packet. |
+| `connected` | `bool` | `True` while the Reader thread is alive and has seen a packet within the last 2 s. |
+
+The tracker uses a `threading.Lock` so the Reader can increment counters from its tight loop without racing the sender's read.
+
+### Link Quality Calculation
+
+$$\text{link\_quality} = \frac{N_\text{valid}}{N_\text{valid} + N_\text{checksum\_errors} + N_\text{bytes\_dropped}} \times 100$$
+
+Counters accumulate since daemon start. The metric reflects the **lifetime** health of the link, a brief noise burst will dilute quickly once normal operation resumes.
+
+<Aside type="tip" title="Interpreting the metric">
+  A quality of 100 % means every byte that arrived formed a valid, checksum-verified packet. Values below 95 % sustained over minutes indicate a noisy RS-422 link, a ground loop, or a damaged cable. Values below 80 % sustained mean data is being lost and the link should be inspected.
+</Aside>
+
+### Dashboard Colour Coding
+
+The Angular SOH popover renders the `link_quality` value with traffic-light colours:
+
+| Range | Colour | Meaning |
+| :--- | :--- | :--- |
+| ≥ 95 % | 🟢 Green | Link healthy |
+| 80 – 95 % | 🟡 Amber | Occasional errors — monitor |
+| < 80 % | 🔴 Red | Significant data loss — investigate |
+
+The `connected` flag drives the status dot in the dashboard header: green and pulsing when `true`, red when `false`.
 
 ---
 
 ## Message Specification
 
-The server broadcasts a standardized JSON payload. Clients use the `type` field to distinguish between waveform data and State-of-Health (SOH) updates.
+Both message types share the same top-level envelope. Clients use `type` to route the payload.
 
-### Sample Payload Example
+```json
+{
+  "type": <int>,
+  "timestamp": "<ISO-8601 UTC>",
+  "payload": { … }
+}
+```
 
+### Type 0 — Waveform Data
+
+```json
+{
+  "type": 0,
+  "timestamp": "2026-04-01T10:23:01.000000Z",
+  "payload": {
+    "channel":   "EHZ",
+    "timestamp": "2026-04-01T10:23:01.000000Z",
+    "fs":        25.0,
+    "data":      [12300, 12305, 12289]
+  }
+}
+```
 
 | Field | Type | Description |
 | :--- | :--- | :--- |
-| `type` | `int` | `0` = Waveform Data, `1` = SOH/Status. |
-| `payload.channel` | `string` | The SEED channel code (e.g., EHZ, EHN). |
-| `payload.fs` | `float` | The actual sampling rate after decimation (25.0). |
-| `payload.data` | `float[]` | Array of 25 filtered samples (1 second of data). |
+| `payload.channel` | `string` | SEED channel code (e.g. `EHZ`, `EHN`, `EHE`) |
+| `payload.timestamp` | `string` | ISO-8601 end-time of the delivered batch |
+| `payload.fs` | `float` | Actual sample rate after decimation (25.0 Hz) |
+| `payload.data` | `number[]` | 25 filtered, decimated samples (1 s of data) |
+
+### Type 1 — State of Health
+
+Broadcast to all connected clients **every 5 seconds**, independently of whether any waveform data is being delivered.
+
+```json
+{
+  "type": 1,
+  "timestamp": "2026-04-01T10:23:05.000000Z",
+  "payload": {
+    "link_quality":    98.7,
+    "checksum_errors": 3,
+    "bytes_dropped":   0,
+    "last_seen":       1743499385.12,
+    "connected":       true
+  }
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `payload.link_quality` | `float` | 0–100 %, higher is better |
+| `payload.checksum_errors` | `int` | Cumulative CRC-32 failures since daemon start |
+| `payload.bytes_dropped` | `int` | Cumulative bytes discarded during re-alignment |
+| `payload.last_seen` | `float` | Unix timestamp of last valid packet from MCU |
+| `payload.connected` | `bool` | Whether the MCU is actively streaming |
+
+---
+
+## Angular Integration
+
+The `WebsocketService` routes messages by `type` field using RxJS `filter()`:
+
+```typescript
+// websocket-service.ts
+getSensorUpdates(): Observable<SensorData> {
+  return this.onEvent<SensorData>(WebsocketMessageTypeEnum.DATA);            // type 0
+}
+
+getStateOfHealth(): Observable<StateOfHealth> {
+  return this.onEvent<StateOfHealth>(WebsocketMessageTypeEnum.STATE_OF_HEALTH); // type 1
+}
+```
+
+The dashboard component subscribes to `getStateOfHealth()` independently of the waveform subscription — an SOH update never blocks a waveform delivery. The payload is passed to a PrimeNG popover component that renders the traffic-light indicator and metric table.
+
+**TypeScript interfaces:**
+
+```typescript
+// state-of-health.ts
+export interface StateOfHealthPayload {
+  link_quality:    number;
+  bytes_dropped:   number;
+  checksum_errors: number;
+  last_seen:       number;
+  connected:       boolean;
+}
+
+export interface StateOfHealth extends BaseWsMessage {
+  payload: StateOfHealthPayload;
+}
+```
 
 ---
 
 ## Performance & Scalability
 
-The WebSocket thread is built on `asyncio` to handle high concurrency with minimal CPU overhead.
+The thread is built on `asyncio` and uses `asyncio.gather` to fan out to all connected clients concurrently. A failed send (dead client) is caught silently and the client is removed from the active set without affecting other clients.
 
-### Resource Impact
-- **Latency:** Total processing time from Queue to Network is **~5ms**.
-- **Bandwidth:** Each client consumes only **~2.4 kbps**. 
-- **Capacity:** A Raspberry Pi 4 can easily sustain **100+ concurrent dashboard clients** without impacting data acquisition.
+| Metric | Value |
+| :--- | :--- |
+| Waveform latency (queue → network) | ~5 ms |
+| SOH broadcast interval | 5 s |
+| Bandwidth per client (waveform only) | ~2.4 kbps |
+| Bandwidth per client (waveform + SOH) | ~2.5 kbps |
+| Concurrent clients (RPi 4) | 100+ |
+
+---
+
+## Configuration
+
+```yaml title="config.yml (excerpt)"
+decimation_factor: 4   # 100 Hz ÷ 4 = 25 Hz broadcast rate
+```
+
+The WebSocket port (8765) and host (0.0.0.0) are currently hardcoded as defaults in the constructor and can be overridden by passing `host=` and `port=` kwargs when instantiating the thread in `main.py`.
 
 ---
 
 ## Troubleshooting
 
-### No data on the Dashboard
-1. **Service Status:** Verify the WebSocket thread is running.
-2. **Port Check:** Ensure port `8765` is open: `sudo ufw allow 8765`.
-3. **Browser Console:** Open Chrome DevTools (F12) and check the "Network" tab under "WS" to see if the connection is `Switching Protocols` or returning `404`.
+### No waveform data on the dashboard
 
-### Dashboard "Jumpy" or Lagging
-- **System Load:** High CPU usage (e.g., during an MSeed merge) can cause minor jitter. Check load with `top`.
-- **Decimation:** If the client network is extremely slow, increase the `decimation_factor` to `8` (12.5 Hz) in `config.yml` to reduce bandwidth by half.
+1. Confirm port 8765 is open: `sudo ufw allow 8765`.
+2. Open browser DevTools → Network → WS tab and verify the connection handshake returns `101 Switching Protocols`.
+3. Check that `decimation_factor` is a supported integer (2, 4, 5, 8, 10) — non-integer or prime factors cause ObsPy's `decimate()` to raise an error and skip the broadcast.
+
+### SOH shows `connected: false` but waveforms are arriving
+
+The `connected` flag is set `false` if the Reader has not produced a valid packet within the last **2 seconds**. This can happen transiently during MCU settings renegotiation at startup. If it persists, check the Reader thread logs for serial errors.
+
+### High `bytes_dropped` with low `checksum_errors`
+
+Many dropped bytes with few CRC errors typically indicates the daemon is restarting frequently — causing mid-packet stream alignment loss — rather than a noisy link. Check for `MCUNoResponse` exceptions in `daemon.log`.
+
+### `link_quality` slowly degrading over days
+
+The counters are **lifetime cumulative** — a brief incident early in the run is permanently reflected in the ratio. A daemon restart resets the counters. If the current link is healthy but the historical metric looks low, this is expected behaviour rather than an ongoing fault.

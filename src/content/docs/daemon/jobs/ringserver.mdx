@@ -1,0 +1,229 @@
+---
+title: RingServerSender Job
+description: Real-time forwarding of seismic data to an EarthScope ringserver via the DataLink protocol.
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem, Steps, Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The **RingServerSender** thread forwards live seismic data to an external **EarthScope ringserver** using the **DataLink** protocol (TCP port 16000). Once data arrives at the ringserver it is immediately available to any **SeedLink** client on the network.
+
+---
+
+## Why a Ringserver?
+
+Running an rpi-seism station in isolation records data locally. Connecting to a ringserver unlocks:
+
+<CardGrid>
+  <Card title="SeedLink Distribution" icon="seti:odata">
+    Any SeedLink client (SeisComP, ObsPy, SWARM) can subscribe and receive your data with sub-second latency.
+  </Card>
+    <Card title="Amateur Networks Integration" icon="external">
+    Amateur networks can ingest your stream directly into their processing pipelines without manual file transfers.
+  </Card>
+  <Card title="Archive Redundancy" icon="document">
+    The ringserver maintains a configurable ring buffer (typically hours to days), acting as a secondary off-site archive.
+  </Card>
+  <Card title="Standard Formats" icon="approve-check">
+    Data is forwarded as FDSN-compliant MiniSEED records — the same format written to the local SDS archive.
+  </Card>
+</CardGrid>
+
+---
+
+## Architecture
+
+```
+Reader thread
+     │
+     ▼
+  data_queue  ──►  RingServerSender
+                         │
+                    buffer samples
+                    per channel
+                         │
+                    build MiniSEED
+                    record (ObsPy)
+                         │
+                    DataLink TCP
+                    (port 16000)
+                         │
+                         ▼
+                   ringserver process
+                         │
+                    SeedLink port
+                    (port 18000)
+                         │
+                         ▼
+              SeisComP / ObsPy / SWARM
+              jAmaseis …
+```
+
+- **Input:** shared `data_queue` — identical raw packet dict to the one consumed by `MSeedWriter`.
+- **Transport:** DataLink over TCP (EarthScope open protocol).
+- **Output:** MiniSEED records injected into the ringserver ring buffer.
+
+---
+
+## DataLink Protocol
+
+DataLink is an EarthScope/IRIS protocol designed for real-time seismic data exchange. The daemon acts as a **DataLink producer** (source); the ringserver acts as a **DataLink server** (sink). Once records are stored in the ring buffer the ringserver makes them available to SeedLink consumers.
+
+Key characteristics:
+
+| Property | Value |
+| :--- | :--- |
+| Transport | TCP |
+| Default port | **16000** |
+| Record format | MiniSEED (any record length) |
+| Connection model | Persistent TCP; reconnect on drop |
+| Flow control | Server-side acknowledgement per record |
+
+<Aside type="note" title="EarthScope ringserver">
+  EarthScope publishes the `ringserver` open-source software at [github.com/EarthScope/ringserver](https://github.com/EarthScope/ringserver). Run your own instance on the Raspberry Pi or on a VPS. The companion tool `mseedarchive` can also write arriving records to a local SDS tree on the server side.
+</Aside>
+
+---
+
+## Buffering & Record Construction
+
+The RingServerSender does **not** write one MiniSEED record per raw packet — that would produce ~100 tiny records per second per channel. Instead it accumulates samples in a per-channel buffer and flushes at a configurable interval.
+
+<Steps>
+1. **Receive** — raw packet dict `{"timestamp": float, "measurements": [...]}` dequeued from `data_queue`.
+2. **Demux** — each channel's `int32` value is appended to the corresponding channel buffer along with its timestamp.
+3. **Interval check** — when the elapsed time since the last flush exceeds `flush_interval` (configurable, default a few seconds), flush all channels.
+4. **MiniSEED build** — for each channel, construct an ObsPy `Trace` with correct FDSN metadata (network, station, location, channel, sampling rate, start time) and serialise to MiniSEED bytes via `st.write(buf, format="MSEED")`.
+5. **DataLink write** — send each record to the ringserver over the persistent TCP connection using the DataLink `WRITE` command. The ringserver acknowledges each record.
+6. **Reset** — clear the channel buffer and record the new start timestamp.
+</Steps>
+
+<Aside type="tip" title="Flush interval vs. latency">
+  A shorter flush interval (e.g. 1 s) gives SeedLink clients lower latency at the cost of smaller — and slightly less compressible — MiniSEED records. A longer interval (e.g. 5–10 s) is more efficient for archive tools that expect larger blocks. The default balances both at a few seconds.
+</Aside>
+
+---
+
+## MiniSEED Record Details
+
+Records sent to the ringserver follow the same conventions as the local SDS archive:
+
+| Metadata | Source |
+| :--- | :--- |
+| Network code | `settings.station.network` |
+| Station code | `settings.station.station` |
+| Location code | `settings.station.location_code` |
+| Channel code | Channel name from settings (e.g. `EHZ`) |
+| Sampling rate | `settings.mcu.sampling_rate` |
+| Start time | Unix timestamp of first sample in buffer |
+| Data type | `int32` raw ADC counts |
+
+Data is forwarded as **raw counts**, instrument response removal happens downstream in ObsPy or SeisComP, using the `station.xml` file that the daemon generates on first run.
+
+---
+
+## Configuration
+
+RingServerSender settings live under `jobs_settings` in `config.yml`:
+
+```yaml title="config.yml (excerpt)"
+jobs_settings:
+  ringserver:
+    host: "127.0.0.1"       # ringserver hostname or IP
+    port: 16000              # DataLink TCP port
+    flush_interval: 5.0      # seconds between MiniSEED flushes
+    enabled: true
+```
+
+| Field | Default | Description |
+| :--- | :--- | :--- |
+| `host` | `127.0.0.1` | Hostname or IP of the ringserver |
+| `port` | `16000` | DataLink TCP port |
+| `flush_interval` | `5.0` | Seconds between per-channel MiniSEED flushes |
+| `enabled` | `true` | Set to `false` to disable without removing the thread |
+
+<Aside type="caution" title="Firewall">
+  If the ringserver runs on a remote host, ensure TCP port **16000** (DataLink) is reachable from the Raspberry Pi.
+</Aside>
+
+---
+
+## Reconnection & Resilience
+
+The sender maintains a single persistent TCP connection. If the connection drops (network interruption, ringserver restart), the thread:
+
+1. Logs a warning and closes the socket.
+2. Enters an exponential back-off retry loop (initial 2 s, maximum 60 s).
+3. Continues buffering incoming samples during the outage — up to a configurable maximum to bound memory usage.
+4. Resumes transmission once the connection is re-established; samples buffered during the outage are sent first.
+
+Data buffered during a disconnect is delivered in order once connectivity is restored. However, if the outage is longer than the in-memory buffer window, the oldest samples are dropped to prevent unbounded memory growth.
+
+---
+
+## Relationship to Local SDS Archive
+
+RingServerSender and `MSeedWriter` operate **independently** on parallel queues. A disconnect from the ringserver does not affect local archiving, and vice versa.
+
+| Concern | MSeedWriter | RingServerSender |
+| :--- | :--- | :--- |
+| Storage target | Local SDS on SD card | Remote ringserver ring buffer |
+| Write trigger | Periodic (30 min) + earthquake flush | Periodic (configurable, seconds) |
+| Data units | Raw counts | Raw counts |
+| Latency | Minutes to hours | Seconds |
+| Fault tolerance | Local disk failure only | Network outages, buffered |
+
+---
+
+## SeedLink Access
+
+Once data is flowing into the ringserver, any SeedLink client can connect to port **18000** (default) to receive the live stream:
+
+<Tabs>
+  <TabItem label="ObsPy">
+    ```python
+    from obspy.clients.seedlink.easyseedlink import create_client
+
+    def handle_data(trace):
+        print(trace)
+
+    client = create_client("my-ringserver.local", on_data=handle_data)
+    client.select_stream("XX", "RPI3", "EH?")
+    client.run()
+    ```
+  </TabItem>
+  <TabItem label="SeisComP (scream)">
+    ```bash
+    # In scream or scconfig, add a SeedLink binding:
+    # host: my-ringserver.local
+    # port: 18000
+    # streams: XX_RPI3_00_EH?
+    ```
+  </TabItem>
+  <TabItem label="SWARM">
+    Configure a new SeedLink source in SWARM:  
+    **Server:** `my-ringserver.local:18000`  
+    **Channels:** `XX$RPI3$00$EHZ`, `XX$RPI3$00$EHN`, `XX$RPI3$00$EHE`
+  </TabItem>
+</Tabs>
+
+---
+
+## Running Your Own Ringserver
+
+For self-hosted testing, the EarthScope ringserver is straightforward to deploy:
+
+```bash
+# Build from source
+git clone https://github.com/EarthScope/ringserver.git
+cd ringserver && make
+
+# Run with a 1 GB ring buffer
+./ringserver -mseedwrite /sds/%Y/%n/%s/%c.D/...  \
+             -DataLinkPort 16000                  \
+             -SeedLinkPort 18000                  \
+             ringserver.ini
+```
+
+The `-mseedwrite` flag mirrors arriving MiniSEED to a local SDS archive on the server, giving a second independent copy of your data at zero extra cost.

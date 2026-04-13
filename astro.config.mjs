@@ -32,7 +32,8 @@ export default defineConfig({
 								{ label: 'Writer', slug: 'daemon/jobs/mseed-writer' },
 								{ label: 'Websocket', slug: 'daemon/jobs/websocket' },
 								{ label: 'Trigger', slug: 'daemon/jobs/trigger' },
-								{ label: 'Notifier', slug: 'daemon/jobs/notifier' }
+								{ label: 'Notifier', slug: 'daemon/jobs/notifier' },
+								{ label: 'Ring Server', slug: 'daemon/jobs/ringserver' }
 							]
 						},
 
